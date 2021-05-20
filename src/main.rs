@@ -6,11 +6,11 @@ use fsdparser::{PacketTypes, Parser};
 use log::{info, LevelFilter};
 use serde::Deserialize;
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use std::{net::SocketAddr};
 use util::*;
 #[cfg(target_os = "windows")]
 use winping::{Buffer, Pinger};
@@ -23,7 +23,7 @@ pub struct VatsimData {
     servers: Vec<VatsimServer>,
 }
 
-/// Represents a server from the `VATSIM_DATA_FEED` endpoint with its IP parsed 
+/// Represents a server from the `VATSIM_DATA_FEED` endpoint with its IP parsed
 #[derive(Deserialize, Debug)]
 pub struct VatsimServer {
     name: String,
@@ -139,7 +139,7 @@ impl VatsimConnector {
     pub fn request_full_data_for(&mut self, callsign: &str) {
         let payload = format!(
             "$CQ{}:{}:ACC:{{\"request\":\"full\"}}\r\n",
-            callsign, self.my_callsign
+            self.my_callsign, callsign
         );
 
         self.stream.write_str(&payload);
@@ -175,12 +175,13 @@ impl VatsimConnector {
     }
 
     /// Processes and reads a message from the server
-    fn get_next_message(&mut self) -> Result<String> {
+    fn get_next_message(&mut self) -> Result<Option<String>> {
         match self.stream.read_string() {
-            Ok(msg) => {
+            Ok(Some(msg)) => {
                 self.process_message(&msg);
-                return Ok(msg);
+                return Ok(Some(msg));
             }
+            Ok(None) => return Ok(None),
             Err(_) => return Err(RunningError::VatsimDisconnected.into()),
         }
     }
@@ -189,7 +190,7 @@ impl VatsimConnector {
         self.stream.write_str(msg);
     }
 
-    pub fn poll(&mut self) -> Result<String> {
+    pub fn poll(&mut self) -> Result<Option<String>> {
         // Check for old aircraft every 5 seconds
         if self.tick.elapsed().as_secs() >= 5 {
             self.remove_old_aircraft();
@@ -203,6 +204,10 @@ impl VatsimConnector {
     pub fn set_my_callsign(&mut self, callsign: String) {
         self.my_callsign = callsign;
     }
+
+    pub fn reset_tracked(&mut self) {
+        self.seen_aircraft.clear();
+    }
 }
 
 /// Handles communication between multiple connections and a VATSIM server
@@ -212,12 +217,14 @@ pub struct VatsimTowerViewProxy {
     streams: Vec<StreamInfo>,
     // The connection to VATSIM
     connector: VatsimConnector,
+    // MSG queue to relay
+    msg_queue: VecDeque<String>,
 }
 
 impl VatsimTowerViewProxy {
     /// Starts the proxy server by binding to port 6809 and connecting to the best VATSIM server
     pub fn start() -> Result<Self> {
-        let listener = TcpListener::bind("0.0.0.0:6809")
+        let listener = TcpListener::bind("127.0.0.1:6809")
             .with_context(|| "Failed to start proxy server. Is another instance running?")?;
         listener.set_nonblocking(true).ok();
 
@@ -229,7 +236,12 @@ impl VatsimTowerViewProxy {
             listener,
             streams: Vec::new(),
             connector,
+            msg_queue: VecDeque::new(),
         })
+    }
+
+    fn is_radar_client_connected(&self) -> bool {
+        self.streams.iter().find(|x| x.is_radar_client).is_some()
     }
 
     /// Accept incoming connections
@@ -238,6 +250,11 @@ impl VatsimTowerViewProxy {
             Ok((stream, addr)) => {
                 info!("Connection from {} connected to the proxy server.", addr);
                 self.streams.push(StreamInfo::new(stream));
+
+                // Probably the tower view that is connected - need to clear tracked in order to request full aircraft configs
+                if self.is_radar_client_connected() {
+                    self.connector.reset_tracked();
+                }
             }
             Err(_) => {}
         }
@@ -249,31 +266,49 @@ impl VatsimTowerViewProxy {
 
         // Relays messages from the VATSIM server to connections
         match self.connector.poll() {
-            Ok(msg) => {
+            Ok(Some(msg)) => {
+                self.msg_queue.push_back(msg);
+            }
+            Err(_) | Ok(None) => {}
+        }
+
+        // Write msgs that weren't relayed before a stream connected
+        if self.streams.len() > 0 {
+            while let Some(msg) = self.msg_queue.pop_front() {
                 for stream_info in self.streams.iter_mut() {
                     stream_info.write_str(&msg);
                 }
             }
-            Err(_) => {}
         }
 
         // Read data from connections and relays to the VATSIM server
         for stream_info in self.streams.iter_mut() {
             let mut msg = match stream_info.read_string() {
-                Ok(m) => m,
-                Err(_) => continue,
+                Ok(Some(m)) => m,
+                Ok(None) => continue,
+                Err(_) => {
+                    // Stream disconnected, check if it was the radar client
+                    if stream_info.is_radar_client {
+                        return Err(RunningError::ATCClientDisconnected.into());
+                    } else {
+                        continue;
+                    }
+                }
             };
 
             let mut should_relay = stream_info.is_radar_client;
 
             match Parser::parse(&msg) {
                 Some(PacketTypes::PlaneInfoRequest(_)) => {
+                    // From the tower view client requesting the info for a plane
                     msg = msg.replace("TOWER", &self.connector.my_callsign); // FIXME:
                     should_relay = true;
                 }
                 Some(PacketTypes::ClientIdentification(info)) => {
+                    // Get the ATC client's callsign from the identification payload it sends
                     self.connector.set_my_callsign(info.from);
                     stream_info.is_radar_client = true;
+                    should_relay = true;
                 }
                 _ => {}
             }
@@ -309,7 +344,10 @@ fn main() -> Result<()> {
         loop {
             match proxy.poll() {
                 Ok(_) => {}
-                Err(e) => display_msg_prompt(&format!("Error occurred: {}", e)),
+                Err(e) => {
+                    display_msg_prompt(&e.to_string());
+                    break;
+                }
             }
             sleep(Duration::from_millis(50));
         }

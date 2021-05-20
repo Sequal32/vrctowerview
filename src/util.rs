@@ -1,19 +1,23 @@
-use std::{io::{Read, Write}, net::{IpAddr, TcpStream}};
 use anyhow::Result;
+use log::error;
 use serde::{Deserialize, Deserializer};
+use std::io::{Read, Write};
+use std::net::{IpAddr, TcpStream};
 
 /// An Error with all the possible runtime errors that could occur specific to the program.
 #[derive(Debug)]
 pub enum RunningError {
     VatsimDisconnected,
-    StreamDisconnected
+    ATCClientDisconnected,
+    StreamDisconnected,
 }
 
 impl std::fmt::Display for RunningError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RunningError::VatsimDisconnected => write!(f, "Lost connection to the VATSIM server."),
-            RunningError::StreamDisconnected => write!(f, "Lost connection to the server.")
+            RunningError::StreamDisconnected => write!(f, "Lost connection to the server."),
+            RunningError::ATCClientDisconnected => write!(f, "Lost connection to the ATC client."),
         }
     }
 }
@@ -36,11 +40,11 @@ where
 
 /// Displays a message, then waits for a newline to be entered into the terminal
 pub fn display_msg_prompt(msg: &str) {
-    println!("{}. Press any key to restart.", msg);
+    error!("{}. Press any key to restart.", msg);
     std::io::stdin().read_line(&mut String::new()).ok();
 }
 
-/// A wrapper for a TcpStream mainly for read/write operations with Strings 
+/// A wrapper for a TcpStream mainly for read/write operations with Strings
 //// with an extra field for determining whether the stream is a radar client connection
 pub struct StreamInfo {
     stream: TcpStream,
@@ -51,12 +55,12 @@ impl StreamInfo {
     pub fn new(stream: TcpStream) -> Self {
         Self {
             stream,
-            is_radar_client: false
+            is_radar_client: false,
         }
     }
 
     /// Read a string from the stream
-    pub fn read_string(&mut self) -> Result<String> {
+    pub fn read_string(&mut self) -> Result<Option<String>> {
         let mut buf = String::new();
 
         match self.stream.read_to_string(&mut buf) {
@@ -64,7 +68,11 @@ impl StreamInfo {
             _ => {}
         }
 
-        Ok(buf)
+        if buf.len() > 0 {
+            Ok(Some(buf))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Write a string to the stream
