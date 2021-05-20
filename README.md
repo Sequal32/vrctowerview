@@ -4,6 +4,8 @@
 
 VRC doesn't support towerview on its own so this program bridges the gap.
 
+WARNING: Use at your own risk! This is **unofficial software that connects to VATSIM servers**, however, it should also be perfectly safe to use as it simply relays messages to/from VRC that would be sent/received to the VATSIM server anyway.
+
 ## Installing
 
 1. Download the latest [release](https://github.com/Sequal32/vrctowerview/releases/latest).
