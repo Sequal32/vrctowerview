@@ -6,7 +6,7 @@ VRC doesn't support towerview on its own so this program bridges the gap.
 
 ## Installing
 
-1. Download the latest [release](https://github.com/Sequal32/vrctowerview/releases/latest) and unzip to a directory of your choice.
+1. Download the latest [release](https://github.com/Sequal32/vrctowerview/releases/latest).
 2. Install [Microsoft Visual C++ Redistributable](https://www.microsoft.com/en-us/download/details.aspx?id=52685).
 3. For VRC:
     Open or *create* `myservers.txt` in `Documents/VRC`. Add the following entry: 
