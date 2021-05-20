@@ -48,10 +48,13 @@ pub struct VatsimServers {
 
 impl VatsimServers {
     pub fn new() -> Self {
+        let mut pinger = Pinger::new_v4().unwrap();
+        pinger.set_timeout(1000);
+
         Self {
             server_data: Vec::new(),
             #[cfg(target_os = "windows")]
-            pinger: Pinger::new_v4().unwrap(),
+            pinger,
         }
     }
 
@@ -118,7 +121,19 @@ impl VatsimConnector {
         servers.fetch_data()?;
 
         #[cfg(target_os = "windows")]
-        let best_server = servers.get_servers_ping()?.first().unwrap().server;
+        let best_server = {
+            let best_servers = servers.get_servers_ping()?;
+
+            for server in best_servers.iter() {
+                if server.ping == u32::MAX {
+                    info!("{}: Unreachable", server.server.name);
+                } else {
+                    info!("Ping to {}: {}ms", server.server.name, server.ping)
+                }
+            }
+
+            best_servers.first().unwrap().server
+        };
         #[cfg(not(target_os = "windows"))] // FIXME: seperate OS implementation?
         let best_server = servers.get_servers().get(0).unwrap();
 
