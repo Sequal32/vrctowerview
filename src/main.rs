@@ -289,8 +289,11 @@ impl VatsimTowerViewProxy {
 
         // Write msgs that weren't relayed before a stream connected
         if self.streams.len() > 0 {
-            while let Some(msg) = self.msg_queue.pop_front() {
+            while let Some(mut msg) = self.msg_queue.pop_front() {
                 for stream_info in self.streams.iter_mut() {
+                    if !stream_info.is_radar_client {
+                        msg = msg.replace("ZBW_TM_OBS", "TOWER");
+                    }
                     stream_info.write_str(&msg);
                 }
             }
@@ -298,7 +301,7 @@ impl VatsimTowerViewProxy {
 
         // Read data from connections and relays to the VATSIM server
         for stream_info in self.streams.iter_mut() {
-            let mut msg = match stream_info.read_string() {
+            let msg = match stream_info.read_string() {
                 Ok(Some(m)) => m,
                 Ok(None) => continue,
                 Err(_) => {
@@ -313,19 +316,25 @@ impl VatsimTowerViewProxy {
 
             let mut should_relay = stream_info.is_radar_client;
 
-            match Parser::parse(&msg) {
-                Some(PacketTypes::PlaneInfoRequest(_)) => {
-                    // From the tower view client requesting the info for a plane
-                    msg = msg.replace("TOWER", &self.connector.my_callsign); // FIXME:
-                    should_relay = true;
+            for msg_slice in msg.split("\n") {
+                match Parser::parse(&msg_slice) {
+                    Some(PacketTypes::PlaneInfoRequest(_)) => {
+                        // From the tower view client requesting the info for a plane
+                        let msg = msg_slice
+                            .to_string()
+                            .replace("TOWER", &self.connector.my_callsign); // FIXME:
+
+                        // Since msg can contain multiple payloads, write this message manually
+                        self.connector.write_message(&(msg + "\r\n"))
+                    }
+                    Some(PacketTypes::ClientIdentification(info)) => {
+                        // Get the ATC client's callsign from the identification payload it sends
+                        self.connector.set_my_callsign(info.from);
+                        stream_info.is_radar_client = true;
+                        should_relay = true;
+                    }
+                    _ => {}
                 }
-                Some(PacketTypes::ClientIdentification(info)) => {
-                    // Get the ATC client's callsign from the identification payload it sends
-                    self.connector.set_my_callsign(info.from);
-                    stream_info.is_radar_client = true;
-                    should_relay = true;
-                }
-                _ => {}
             }
 
             // Relay message
@@ -355,6 +364,8 @@ fn main() -> Result<()> {
                 continue;
             }
         };
+
+        info!("Waiting for connection from the ATC client and the towerview client.");
 
         loop {
             match proxy.poll() {
