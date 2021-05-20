@@ -15,11 +15,6 @@ WARNING: Use at your own risk! This is **unofficial software that connects to VA
     ```
     `127.0.0.1 TOWERVIEWPROXY`
     ```
-   For Euroscope:
-   Open or *create* `myipaddr.txt` in `Documents/EuroScope`. Add the following entry: 
-    ```
-    127.0.0.1 TOWERVIEW-PROXY
-    ```
 4. Start `towerview.exe`
 5. Connect using the new server in VRC/Euroscope. (The best VATSIM server will be selected based on ping.)
 6. Send `.towerview` in vPilot or the equivalent command in other pilot clients.
