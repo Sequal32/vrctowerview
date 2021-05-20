@@ -1,56 +1,29 @@
-use anyhow::Result;
+mod util;
+
+use anyhow::{Context, Result};
 use attohttpc;
 use fsdparser::{PacketTypes, Parser};
 use log::{info, LevelFilter};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use simplelog::{ColorChoice, Config, TermLogger, TerminalMode};
-use std::collections::{HashMap, VecDeque};
-use std::io::Read;
+use std::collections::HashMap;
 use std::net::{IpAddr, TcpListener, TcpStream};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use std::{io::Write, net::SocketAddr};
+use std::{net::SocketAddr};
+use util::*;
+#[cfg(target_os = "windows")]
 use winping::{Buffer, Pinger};
 
 const VATSIM_DATA_FEED: &str = "https://data.vatsim.net/v3/vatsim-data.json";
 
-#[derive(Debug)]
-enum RunningError {
-    ATCClientDisconnected,
-    VatsimDisconnected,
-}
-
-impl std::fmt::Display for RunningError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RunningError::ATCClientDisconnected => {
-                write!(f, "Lost connection with the ATC client.")
-            }
-            RunningError::VatsimDisconnected => write!(f, "Lost connection to the VATSIM server."),
-        }
-    }
-}
-
-impl std::error::Error for RunningError {}
-
-fn to_ip<'de, D>(deserializer: D) -> Result<Option<IpAddr>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let server_str = String::deserialize(deserializer)?;
-    // Parse string into an IpAddr or lookup the IPv4 hostname
-    Ok(server_str.parse::<IpAddr>().ok().or_else(|| {
-        dns_lookup::lookup_host(&server_str)
-            .ok()
-            .and_then(|ips| ips.into_iter().find(|&x| x.is_ipv4()))
-    }))
-}
-
+/// Represents the servers fetched from the `VATSIM_DATA_FEED` endpoint.
 #[derive(Deserialize, Debug)]
 pub struct VatsimData {
     servers: Vec<VatsimServer>,
 }
 
+/// Represents a server from the `VATSIM_DATA_FEED` endpoint with its IP parsed 
 #[derive(Deserialize, Debug)]
 pub struct VatsimServer {
     name: String,
@@ -59,14 +32,17 @@ pub struct VatsimServer {
     pub ip: Option<IpAddr>,
 }
 
+/// A wrapper struct for a `VatsimServer` and the ping from the client to it
 #[derive(Debug)]
 pub struct VatsimServerData<'a> {
     pub server: &'a VatsimServer,
     pub ping: u32,
 }
 
+/// Fetches data from the `VATSIM_DATA_FEED` endpoint with the capability of pinging them.
 pub struct VatsimServers {
     server_data: Vec<VatsimServer>,
+    #[cfg(target_os = "windows")]
     pinger: Pinger,
 }
 
@@ -74,10 +50,12 @@ impl VatsimServers {
     pub fn new() -> Self {
         Self {
             server_data: Vec::new(),
+            #[cfg(target_os = "windows")]
             pinger: Pinger::new_v4().unwrap(),
         }
     }
 
+    /// Fetches data from a request to the `VATSIM_DATA_FEED` endpoint
     pub fn fetch_data(&mut self) -> Result<()> {
         let data = attohttpc::get(VATSIM_DATA_FEED)
             .send()?
@@ -89,10 +67,13 @@ impl VatsimServers {
         Ok(())
     }
 
+    /// Retrieves the data from the last fetch
     pub fn get_servers(&self) -> &Vec<VatsimServer> {
         &self.server_data
     }
 
+    /// Pings all the VATSIM servers and returns an array sorted based on server RTT
+    #[cfg(target_os = "windows")]
     fn get_servers_ping(&mut self) -> Result<Vec<VatsimServerData>> {
         let pinger = &mut self.pinger;
 
@@ -116,54 +97,69 @@ impl VatsimServers {
     }
 }
 
-///
+/// Handles a connection to a VATSIM server
 pub struct VatsimConnector {
-    stream: TcpStream,
+    // The connection
+    stream: StreamInfo,
+    // The name of the connected server
     connected_to: String,
-
-    my_callsign: Option<String>,
+    // The callsign to be used when communicating with the server
+    my_callsign: String,
+    // A callsign map to track added/removed aircraft
     seen_aircraft: HashMap<String, Instant>,
-    aircraft_request_queue: VecDeque<String>,
+    // Used for polling
     tick: Instant,
 }
 
 impl VatsimConnector {
+    /// Connects to the best VATSIM server based on ping.
     pub fn connect_to_best_server() -> Result<Self> {
         let mut servers = VatsimServers::new();
         servers.fetch_data()?;
 
+        #[cfg(target_os = "windows")]
         let best_server = servers.get_servers_ping()?.first().unwrap().server;
+        #[cfg(not(target_os = "windows"))] // FIXME: seperate OS implementation?
+        let best_server = servers.get_servers().get(0).unwrap();
 
         let stream = TcpStream::connect(SocketAddr::new(best_server.ip.unwrap(), 6809))?;
         stream.set_nonblocking(true).ok();
 
         Ok(Self {
-            stream,
+            stream: StreamInfo::new(stream),
             connected_to: best_server.name.clone(),
-            my_callsign: None,
+            my_callsign: String::new(),
             seen_aircraft: HashMap::new(),
-            aircraft_request_queue: VecDeque::new(),
             tick: Instant::now(),
         })
     }
 
+    /// Manually requests a full aircraft configuration data from the server for the specified
+    /// `callsign`.
     pub fn request_full_data_for(&mut self, callsign: &str) {
         let payload = format!(
             "$CQ{}:{}:ACC:{{\"request\":\"full\"}}\r\n",
-            if let Some(callsign) = self.my_callsign.as_ref() {
-                callsign
-            } else {
-                ""
-            },
-            callsign
+            callsign, self.my_callsign
         );
 
-        self.stream.write_all(payload.as_bytes()).ok();
+        self.stream.write_str(&payload);
     }
 
+    /// Removes a tracked aircraft if no position data was received for at least 15 seconds
     fn remove_old_aircraft(&mut self) {
         self.seen_aircraft
             .retain(|_, time| time.elapsed().as_secs() <= 15);
+    }
+
+    /// Maps a callsign to an instant in time to keep track of newly added aircraft
+    /// and aircraft no longer tracked
+    fn add_aircraft(&mut self, callsign: String) {
+        let seen = self.seen_aircraft.insert(callsign.clone(), Instant::now());
+        // New aircraft added - requests full aircraft configuration
+        if seen.is_none() {
+            info!("Request full aircraft config for {}", callsign);
+            self.request_full_data_for(&callsign);
+        }
     }
 
     fn process_message(&mut self, msg: &str) {
@@ -171,44 +167,26 @@ impl VatsimConnector {
         for msg in msg.split("\n") {
             match Parser::parse(msg) {
                 Some(PacketTypes::PilotPosition(p)) => {
-                    // Request full aircraft configuration
-                    let seen = self
-                        .seen_aircraft
-                        .insert(p.callsign.clone(), Instant::now());
-
-                    if seen.is_none() {
-                        info!("Request full aircraft config for {}", p.callsign);
-                        self.aircraft_request_queue.push_back(p.callsign);
-                    }
+                    self.add_aircraft(p.callsign);
                 }
                 _ => {}
             }
         }
-
-        self.remove_old_aircraft();
     }
 
+    /// Processes and reads a message from the server
     fn get_next_message(&mut self) -> Result<String> {
-        let mut msg = String::new();
-
-        match self.stream.read_to_string(&mut msg) {
-            Ok(0) => return Err(RunningError::VatsimDisconnected.into()),
-            _ => {}
+        match self.stream.read_string() {
+            Ok(msg) => {
+                self.process_message(&msg);
+                return Ok(msg);
+            }
+            Err(_) => return Err(RunningError::VatsimDisconnected.into()),
         }
-
-        self.process_message(&msg);
-
-        Ok(msg)
     }
 
-    fn poll_aircraft_queue(&mut self) {
-        if self.my_callsign.is_none() {
-            return;
-        };
-
-        if let Some(callsign) = self.aircraft_request_queue.pop_front() {
-            self.request_full_data_for(&callsign);
-        }
+    pub fn write_message(&mut self, msg: &str) {
+        self.stream.write_str(msg);
     }
 
     pub fn poll(&mut self) -> Result<String> {
@@ -217,132 +195,92 @@ impl VatsimConnector {
             self.remove_old_aircraft();
             self.tick = Instant::now();
         }
-        self.poll_aircraft_queue();
         // Receive data from the VATSIM server
         self.get_next_message()
     }
 
-    pub fn write_message(&mut self, string: &str) {
-        self.stream.write_all(string.as_bytes()).ok();
-    }
-
+    /// Sets the callsign to be used when "manually" requesting data from the server
     pub fn set_my_callsign(&mut self, callsign: String) {
-        self.my_callsign = Some(callsign);
-    }
-
-    pub fn is_callsign_set(&self) -> bool {
-        self.my_callsign.is_some()
+        self.my_callsign = callsign;
     }
 }
 
-struct StreamInfo {
-    stream: TcpStream,
-    is_radar_client: bool,
-}
-
+/// Handles communication between multiple connections and a VATSIM server
 pub struct VatsimTowerViewProxy {
     listener: TcpListener,
     // Connected streams
     streams: Vec<StreamInfo>,
     // The connection to VATSIM
-    connector: Option<VatsimConnector>,
-    callsign_found: Option<String>,
+    connector: VatsimConnector,
 }
 
 impl VatsimTowerViewProxy {
-    pub fn new() -> Self {
-        let listener = TcpListener::bind("127.0.0.1:6809").expect("Failed to bind server");
+    /// Starts the proxy server by binding to port 6809 and connecting to the best VATSIM server
+    pub fn start() -> Result<Self> {
+        let listener = TcpListener::bind("0.0.0.0:6809")
+            .with_context(|| "Failed to start proxy server. Is another instance running?")?;
         listener.set_nonblocking(true).ok();
 
-        Self {
+        info!("Attempting to connect to VATSIM...");
+        let connector = VatsimConnector::connect_to_best_server()?;
+        info!("Connected to VATSIM Server {}", connector.connected_to);
+
+        Ok(Self {
             listener,
             streams: Vec::new(),
-            connector: None,
-            callsign_found: None,
-        }
+            connector,
+        })
     }
 
+    /// Accept incoming connections
     fn accept_connections(&mut self) {
         match self.listener.accept() {
             Ok((stream, addr)) => {
                 info!("Connection from {} connected to the proxy server.", addr);
-                self.streams.push(StreamInfo {
-                    stream,
-                    is_radar_client: false,
-                });
+                self.streams.push(StreamInfo::new(stream));
             }
             Err(_) => {}
         }
     }
 
-    fn try_get_callsign(msg: &str) -> Option<String> {
-        match Parser::parse(&msg) {
-            Some(PacketTypes::ATCPosition(atc)) => return Some(atc.callsign),
-            _ => {}
-        }
-        return None;
-    }
-
-    fn is_plane_info_request(msg: &str) -> bool {
-        match Parser::parse(&msg) {
-            Some(PacketTypes::PlaneInfoRequest(_)) => true,
-            _ => false,
-        }
-    }
-
+    /// Processes communication between connections to the proxy server and the VATSIM server
     pub fn poll(&mut self) -> Result<()> {
         self.accept_connections();
 
-        if self.streams.len() == 0 {
-            return Ok(());
-        }
-        // Connect to VATSIM if not connected
-        if self.connector.is_none() && self.callsign_found.is_some() {
-            let mut connector = VatsimConnector::connect_to_best_server()?;
-            connector.set_my_callsign(self.callsign_found.take().unwrap());
-
-            info!("Connected to the {} VATSIM Server", connector.connected_to);
-
-            self.connector = Some(connector);
-        }
-
-        // RECEIVE DATA
-        if let Some(connector) = self.connector.as_mut() {
-            match connector.poll() {
-                Ok(msg) => {
-                    // Relay VATSIM server message to connections
-                    for stream_info in self.streams.iter_mut() {
-                        stream_info.stream.write_all(msg.as_bytes()).ok();
-                    }
+        // Relays messages from the VATSIM server to connections
+        match self.connector.poll() {
+            Ok(msg) => {
+                for stream_info in self.streams.iter_mut() {
+                    stream_info.write_str(&msg);
                 }
-                Err(_) => {}
             }
+            Err(_) => {}
         }
-        // WRITE DATA
-        for stream_info in self.streams.iter_mut() {
-            let mut msg = String::new();
 
-            match stream_info.stream.read_to_string(&mut msg) {
-                Ok(0) => return Err(RunningError::VatsimDisconnected.into()),
-                _ => {}
+        // Read data from connections and relays to the VATSIM server
+        for stream_info in self.streams.iter_mut() {
+            let mut msg = match stream_info.read_string() {
+                Ok(m) => m,
+                Err(_) => continue,
             };
 
-            if msg.len() == 0 {
-                continue;
-            }
+            let mut should_relay = stream_info.is_radar_client;
 
-            if let Some(callsign) = Self::try_get_callsign(&msg) {
-                self.callsign_found = Some(callsign);
-                stream_info.is_radar_client = true;
-            }
-
-            if let Some(connector) = self.connector.as_mut() {
-                if stream_info.is_radar_client {
-                    connector.write_message(&msg);
-                } else if Self::is_plane_info_request(&msg) {
-                    let new_msg = msg.replace("TOWER", connector.my_callsign.as_ref().unwrap()); // FIXME:
-                    connector.write_message(&new_msg)
+            match Parser::parse(&msg) {
+                Some(PacketTypes::PlaneInfoRequest(_)) => {
+                    msg = msg.replace("TOWER", &self.connector.my_callsign); // FIXME:
+                    should_relay = true;
                 }
+                Some(PacketTypes::ClientIdentification(info)) => {
+                    self.connector.set_my_callsign(info.from);
+                    stream_info.is_radar_client = true;
+                }
+                _ => {}
+            }
+
+            // Relay message
+            if should_relay {
+                self.connector.write_message(&msg);
             }
         }
 
@@ -359,12 +297,21 @@ fn main() -> Result<()> {
     )
     .ok();
 
-    let mut proxy = VatsimTowerViewProxy::new();
-
     loop {
-        proxy.poll();
-        sleep(Duration::from_millis(50));
-    }
+        let mut proxy = match VatsimTowerViewProxy::start() {
+            Ok(p) => p,
+            Err(e) => {
+                display_msg_prompt(&format!("Could not start proxy server! Reason: {}", e));
+                continue;
+            }
+        };
 
-    Ok(())
+        loop {
+            match proxy.poll() {
+                Ok(_) => {}
+                Err(e) => display_msg_prompt(&format!("Error occurred: {}", e)),
+            }
+            sleep(Duration::from_millis(50));
+        }
+    }
 }
