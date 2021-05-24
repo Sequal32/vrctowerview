@@ -291,9 +291,6 @@ impl VatsimTowerViewProxy {
         if self.streams.len() > 0 {
             while let Some(mut msg) = self.msg_queue.pop_front() {
                 for stream_info in self.streams.iter_mut() {
-                    if !stream_info.is_radar_client {
-                        msg = msg.replace("ZBW_TM_OBS", "TOWER");
-                    }
                     stream_info.write_str(&msg);
                 }
             }
